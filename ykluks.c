@@ -97,7 +97,7 @@ int challenge_response(YK_KEY *yk, unsigned char *challenge, unsigned char *resp
   unsigned char internal_response[64];
   unsigned int response_len = 0;
 
-  memset(response, 0, sizeof(response));
+  memset(response, 0, HASH_LENGTH);
 
   if (!yk_write_to_key(yk, SLOT_CHAL_HMAC2, challenge, HASH_LENGTH)) return 0;
 
