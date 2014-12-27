@@ -4,6 +4,10 @@
 #include <string.h>
 #include <time.h>
 
+#define GCRYPT_NO_MPI_MACROS 1
+#define GCRYPT_NO_DEPRECATED 1
+#include <gcrypt.h>
+
 //Yubikey
 #include <ykpers.h>
 #include <yubikey.h>
@@ -11,73 +15,14 @@
 
 #define YK_SLOT 2
 
-
-
+#define KDF_KEY_SIZE 40
 
 /**
- * Convert binary data to ASCII encoding using Crockford Base32 encoding.
- * Does not append 0-terminator, but returns a pointer to the place where
- * it should be placed, if needed.
- *
- * @param data data to encode
- * @param size size of data (in bytes)
- * @param out buffer to fill
- * @param out_size size of the buffer. Must be large enough to hold
- * ((size*8) + (((size*8) % 5) > 0 ? 5 - ((size*8) % 5) : 0)) / 5 bytes
- * @return pointer to the next byte in 'out' or NULL on error.
+ * Log an error message at log-level 'level' that indicates
+ * a failure of the command 'cmd' with the message given
+ * by gcry_strerror(rc).
  */
-char *
-data_to_string (const void *data, size_t size, char *out, size_t out_size)
-{
-  /**
-   * 32 characters for encoding
-   */
-  static char *encTable__ = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-  unsigned int wpos;
-  unsigned int rpos;
-  unsigned int bits;
-  unsigned int vbit;
-  const unsigned char *udata;
-
-  /* GNUNET_assert (data != NULL); */
-  /* GNUNET_assert (out != NULL); */
-  udata = data;
-  if (out_size < (((size*8) + ((size*8) % 5)) % 5))
-  {
-    //GNUNET_break (0);
-    return NULL;
-  }
-  vbit = 0;
-  wpos = 0;
-  rpos = 0;
-  bits = 0;
-  while ((rpos < size) || (vbit > 0))
-  {
-    if ((rpos < size) && (vbit < 5))
-    {
-      bits = (bits << 8) | udata[rpos++];   /* eat 8 more bits */
-      vbit += 8;
-    }
-    if (vbit < 5)
-    {
-      bits <<= (5 - vbit);      /* zero-padding */
-      //GNUNET_assert (vbit == ((size * 8) % 5));
-      vbit = 5;
-    }
-    if (wpos >= out_size)
-    {
-      //GNUNET_break (0);
-      return NULL;
-    }
-    out[wpos++] = encTable__[(bits >> (vbit - 5)) & 31];
-    vbit -= 5;
-  }
-  //GNUNET_assert (vbit == 0);
-  if (wpos < out_size)
-    out[wpos] = '\0';
-  return &out[wpos];
-}
-
+#define LOG_GCRY(cmd, rc) do { fprintf(stderr, "`%s' failed at %s:%d with error: %s\n", cmd, __FILE__, __LINE__, gcry_strerror(rc)); } while(0)
 
 int
 main(int argc, const char* argv[])
@@ -88,7 +33,31 @@ main(int argc, const char* argv[])
   unsigned int bytes_read;
   unsigned char enc[(SHA1_MAX_BLOCK_SIZE * 2) + 1];
   unsigned int expect_bytes = 20;
+  const char *passphrase;
+  unsigned char key[KDF_KEY_SIZE];
+  gcry_error_t gerr;
 
+  if (!gcry_check_version (GCRYPT_VERSION))
+  {
+    fputs("libgcrypt version mismatch\n", stderr);
+    return 1;
+  }
+  /* Tell Libgcrypt that initialization has completed. */
+  gcry_control (GCRYCTL_INITIALIZATION_FINISHED, 0);
+  passphrase = "password";
+  if (0 != (gerr = gcry_kdf_derive (passphrase, strlen(passphrase),
+                                    GCRY_KDF_PBKDF2,
+                                    GCRY_MD_SHA1,
+                                    (const void *) "salt", 4, /* salt & salt length */
+                                    4, /* iterations */
+                                    KDF_KEY_SIZE, key)))
+  {
+    LOG_GCRY ("gcry_kdf_derive", gerr);
+    return 1;
+  }
+  (void) memset (enc, sizeof(enc), 0);
+  yubikey_hex_encode (enc, key, KDF_KEY_SIZE);
+  (void) printf ("Derived key: %s\n", enc);
   if (!yk_init())
     return 1;
   yk = yk_open_first_key ();
@@ -106,9 +75,8 @@ main(int argc, const char* argv[])
                                   &bytes_read))
     return 5;
   (void) memset (enc, sizeof(enc), 0);
-  yubikey_hex_encode (enc, response, SHA1_MAX_BLOCK_SIZE);
+  yubikey_hex_encode (enc, response, expect_bytes);
   (void) printf ("Response: %s\n", enc);
-  challenge="test";
   if (!yk_challenge_response (yk,
                               SLOT_CHAL_HMAC2,
                               1,
@@ -116,7 +84,7 @@ main(int argc, const char* argv[])
                               sizeof(response), response))
     return 6;
   (void) memset (enc, sizeof(enc), 0);
-  yubikey_hex_encode (enc, response, SHA1_MAX_BLOCK_SIZE);
+  yubikey_hex_encode (enc, response, expect_bytes);
   (void) printf ("Respons2: %s\n", enc);
   if (!yk_close_key (yk))
     return 2;
