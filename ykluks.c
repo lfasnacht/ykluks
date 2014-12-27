@@ -47,6 +47,17 @@
 #define LUKS_ITERATION_MS 1
 #define WAIT_TIME 15
 
+#define GCRYPT_NO_MPI_MACROS 1
+#define GCRYPT_NO_DEPRECATED 1
+#include <gcrypt.h>
+
+/**
+ * Log an error message at log-level 'level' that indicates
+ * a failure of the command 'cmd' with the message given
+ * by gcry_strerror(rc).
+ */
+#define LOG_GCRY(cmd, rc) do { fprintf(stderr, "`%s' failed at %s:%d with error: %s\n", cmd, __FILE__, __LINE__, gcry_strerror(rc)); } while(0)
+
 //Convention in this file: a function return 1 if successful, 0 otherwise
 //Topics:
 // - Yubikey
@@ -91,15 +102,67 @@ out:
   return ret;
 }
 
+static const char *
+ask_pass ()
+{
+  static char buf[512];
+
+  printf ("Enter passphrase\n");
+  fflush (stdout);
+  return fgets(buf, sizeof(buf), stdin);
+}
+
+static void
+print_enc (const char *prefix, unsigned char *buf, size_t len)
+{
+  char *enc;
+  size_t enc_len;
+
+  enc_len = (len * 2) + 1;
+  enc = malloc (enc_len);
+  (void) memset (enc, enc_len, 0);
+  yubikey_hex_encode (enc, buf, len);
+  (void) printf ("%s: %s\n", prefix, enc);
+  free (enc);
+}
+
+static void
+xor_mix (unsigned char *challenge, unsigned char *key, size_t len)
+{
+  unsigned int cnt;
+  const char *pass;
+  gcry_error_t gerr;
+
+  for (cnt=0; cnt<len; cnt++)
+    challenge[cnt] ^= key[cnt];
+}
+
 //Do a HMAC challenge-response on slot 2 for a HASH_LENGTH-byte challenge, and give a HASH_LENGTH-byte response
 int challenge_response(YK_KEY *yk, unsigned char *challenge, unsigned char *response)
 {
   unsigned char internal_response[64];
   unsigned int response_len = 0;
+  unsigned char xored_challenge[HASH_LENGTH];
+  gcry_error_t gerr;
+  const char *pass;
 
+  pass = ask_pass ();
+  if (0 != (gerr = gcry_kdf_derive (pass, strlen(pass),
+                                    GCRY_KDF_PBKDF2,
+                                    GCRY_MD_SHA1,
+                                    "salt0x88", 4, /* salt & salt length */
+                                    4, /* iterations */
+                                    HASH_LENGTH, xored_challenge)))
+  {
+    LOG_GCRY ("gcry_kdf_derive", gerr);
+    return 0;
+  }
+  print_enc ("DRV pass", xored_challenge, HASH_LENGTH);
   memset(response, 0, HASH_LENGTH);
+  xor_mix (xored_challenge, challenge, HASH_LENGTH);
+  print_enc ("XORed chal", xored_challenge, HASH_LENGTH);
 
-  if (!yk_write_to_key(yk, SLOT_CHAL_HMAC2, challenge, HASH_LENGTH)) return 0;
+  if (!yk_write_to_key(yk, SLOT_CHAL_HMAC2, xored_challenge, HASH_LENGTH)) return 0;
 
   if (!yk_read_response_from_key(yk, YK_SLOT, YK_FLAG_MAYBLOCK, &internal_response, 64, HASH_LENGTH, &response_len))
     return 0;
@@ -376,7 +439,7 @@ int get_random_challenge(unsigned char* challenge) {
   int ret = 0;
   FILE *random;
   
-  random = fopen("/dev/random","r");
+  random = fopen("/dev/urandom","r");
   
   if (fread(challenge, 1, HASH_LENGTH, random) == HASH_LENGTH) {
     ret = 1;
@@ -400,9 +463,14 @@ int main(int argc, char **argv) {
     fprintf(stderr,"Usage: %s [device] [name]\n",argv[0]);
     return 1;
   }
-  
+  if (!gcry_check_version (GCRYPT_VERSION))
+  {
+    fprintf(stderr, "libgcrypt version mismatch\n");
+    return 1;
+  }
   if (!is_luks(argv[1])) {
-    fprintf(stderr,"Error: unable to open LUKS device (not root/invalid file?)\n");
+    fprintf(stderr,"Error: unable to open LUKS device %s (not root/invalid file?)\n",
+            argv[1]);
     return 1;
   }
   
@@ -413,9 +481,9 @@ int main(int argc, char **argv) {
   
   fprintf(stderr, "Reading challenge...");
   if (!get_challenge(argv[1],challenge)) {
-    fprintf(stderr,"Error: unable to read challenge, using /dev/random!\n");
+    fprintf(stderr,"Error: unable to read challenge, using /dev/urandom!\n");
     if (!get_random_challenge(challenge)) {
-      fprintf(stderr,"Error: unable to use /dev/random!\n");
+      fprintf(stderr,"Error: unable to use /dev/urandom!\n");
       return 1;
     }
   }
