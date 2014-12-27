@@ -9,7 +9,7 @@ pkg_search_module(CRYPTSETUP REQUIRED libcryptsetup>=1.4.0)
 include_directories(${YKPERS_INCLUDE_DIRS} ${CRYPTSETUP_INCLUDE_DIRS})
 
 add_executable(ykluks ykluks.c)
-target_link_libraries (ykluks ${YKPERS_LIBRARIES} ${CRYPTSETUP_LIBRARIES})
+target_link_libraries (ykluks ${YKPERS_LIBRARIES} ${CRYPTSETUP_LIBRARIES} -lgcrypt)
 
 if(${BUILD_STATIC})
   message(${BUILD_STATIC})

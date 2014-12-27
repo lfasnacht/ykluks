@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2012 Laurent Fasnacht
- * 
+ * Copyright (c) 2014 Sree Harsha Totakura
+ *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
  * version 2 as published by the Free Software Foundation.
@@ -13,9 +14,9 @@
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
- * 
+ *
  * This source code is based on:
- * 
+ *
  * - ykchalresp.c (ykpers, license: BSD-2)
  *    * Copyright (c) 2011-2012 Yubico AB.
  * 
@@ -23,7 +24,7 @@
  *    * Copyright (C) 2004, Christophe Saout <christophe@saout.de>
  *    * Copyright (C) 2004-2007, Clemens Fruhwirth <clemens@endorphin.org>
  *    * Copyright (C) 2009-2012, Red Hat, Inc. All rights reserved.
- * 
+ *
  */
 
 #include <stdio.h>
@@ -105,25 +106,13 @@ out:
 static const char *
 ask_pass ()
 {
-  static char buf[512];
+  static char buf[512];         /* Secure this using gcrypt secure mem? */
 
-  printf ("Enter passphrase\n");
+  if (0 != (unsigned char) buf[0])
+    return buf;
+  printf ("Enter passphrase for 2 factor auth:");
   fflush (stdout);
   return fgets(buf, sizeof(buf), stdin);
-}
-
-static void
-print_enc (const char *prefix, unsigned char *buf, size_t len)
-{
-  char *enc;
-  size_t enc_len;
-
-  enc_len = (len * 2) + 1;
-  enc = malloc (enc_len);
-  (void) memset (enc, enc_len, 0);
-  yubikey_hex_encode (enc, buf, len);
-  (void) printf ("%s: %s\n", prefix, enc);
-  free (enc);
 }
 
 static void
@@ -157,10 +146,8 @@ int challenge_response(YK_KEY *yk, unsigned char *challenge, unsigned char *resp
     LOG_GCRY ("gcry_kdf_derive", gerr);
     return 0;
   }
-  print_enc ("DRV pass", xored_challenge, HASH_LENGTH);
   memset(response, 0, HASH_LENGTH);
   xor_mix (xored_challenge, challenge, HASH_LENGTH);
-  print_enc ("XORed chal", xored_challenge, HASH_LENGTH);
 
   if (!yk_write_to_key(yk, SLOT_CHAL_HMAC2, xored_challenge, HASH_LENGTH)) return 0;
 
@@ -489,7 +476,7 @@ int main(int argc, char **argv) {
   }
   fprintf(stderr, "done!\n");
   
-  fprintf(stderr, "Challenging the Yubikey...");
+  fprintf(stderr, "Challenging the Yubikey...\n");
   if (yk_query(challenge, response, new_challenge, new_response)) {
     //Ok we are successful, so we need to write new challenge
     write_new_challenge = 1;
