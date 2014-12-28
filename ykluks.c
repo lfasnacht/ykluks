@@ -19,7 +19,7 @@
  *
  * - ykchalresp.c (ykpers, license: BSD-2)
  *    * Copyright (c) 2011-2012 Yubico AB.
- * 
+ *
  * - cryptsetup.c (cryptsetup, license: GPL-2)
  *    * Copyright (C) 2004, Christophe Saout <christophe@saout.de>
  *    * Copyright (C) 2004-2007, Clemens Fruhwirth <clemens@endorphin.org>
@@ -40,6 +40,9 @@
 #include <yubikey.h>
 #include <ykdef.h>
 
+#include <termios.h>
+#include <unistd.h>
+
 #define HASH_LENGTH 20
 #define YK_SLOT 2
 #define LUKS_KEY_SLOT 6
@@ -58,6 +61,11 @@
  * by gcry_strerror(rc).
  */
 #define LOG_GCRY(cmd, rc) do { fprintf(stderr, "`%s' failed at %s:%d with error: %s\n", cmd, __FILE__, __LINE__, gcry_strerror(rc)); } while(0)
+
+/**
+ * Original termos settings from our terminal
+ */
+static struct termios tc_orig;
 
 //Convention in this file: a function return 1 if successful, 0 otherwise
 //Topics:
@@ -107,12 +115,20 @@ static const char *
 ask_pass ()
 {
   static char buf[512];         /* Secure this using gcrypt secure mem? */
+  struct termios tc;
+  const char *pass;
 
   if (0 != (unsigned char) buf[0])
     return buf;
   printf ("Enter passphrase for 2 factor auth:");
   fflush (stdout);
-  return fgets(buf, sizeof(buf), stdin);
+  tc = tc_orig;
+  (void) memcpy (&tc, &tc_orig, sizeof (tc));
+  tc.c_lflag &= ~(ECHO);
+  (void) tcsetattr (STDIN_FILENO, TCSANOW, &tc);
+  pass = fgets(buf, sizeof(buf), stdin);
+  (void) tcsetattr (STDIN_FILENO, TCSANOW, &tc_orig);
+  return pass;
 }
 
 static void
@@ -440,12 +456,21 @@ int get_random_challenge(unsigned char* challenge) {
 int main(int argc, char **argv) {
   int luks_opened = 0;
   int write_new_challenge = 0;
-  
   unsigned char challenge[HASH_LENGTH];
   unsigned char response[HASH_LENGTH];
   unsigned char new_challenge[HASH_LENGTH];
   unsigned char new_response[HASH_LENGTH];
-  
+
+  if (!isatty(STDIN_FILENO))
+  {
+    fprintf (stderr, "cannot find an associated pty\n");
+    return 1;
+  }
+  if (0 != tcgetattr (STDIN_FILENO, &tc_orig))
+  {
+    fprintf(stderr,"Cannot access terminal settings; are you running from a terminal?\n");
+    return 1;
+  }
   if (argc != 3) {
     fprintf(stderr,"Usage: %s [device] [name]\n",argv[0]);
     return 1;
