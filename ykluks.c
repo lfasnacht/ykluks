@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2012 Laurent Fasnacht
- * 
+ * Copyright (c) 2014 Sree Harsha Totakura
+ *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
  * version 2 as published by the Free Software Foundation.
@@ -13,17 +14,17 @@
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
- * 
+ *
  * This source code is based on:
- * 
+ *
  * - ykchalresp.c (ykpers, license: BSD-2)
  *    * Copyright (c) 2011-2012 Yubico AB.
- * 
+ *
  * - cryptsetup.c (cryptsetup, license: GPL-2)
  *    * Copyright (C) 2004, Christophe Saout <christophe@saout.de>
  *    * Copyright (C) 2004-2007, Clemens Fruhwirth <clemens@endorphin.org>
  *    * Copyright (C) 2009-2012, Red Hat, Inc. All rights reserved.
- * 
+ *
  */
 
 #include <stdio.h>
@@ -39,6 +40,9 @@
 #include <yubikey.h>
 #include <ykdef.h>
 
+#include <termios.h>
+#include <unistd.h>
+
 #define HASH_LENGTH 20
 #define YK_SLOT 2
 #define LUKS_KEY_SLOT 6
@@ -46,6 +50,22 @@
 #define LUKS_FLAGS (CRYPT_ACTIVATE_ALLOW_DISCARDS)
 #define LUKS_ITERATION_MS 1
 #define WAIT_TIME 15
+
+#define GCRYPT_NO_MPI_MACROS 1
+#define GCRYPT_NO_DEPRECATED 1
+#include <gcrypt.h>
+
+/**
+ * Log an error message at log-level 'level' that indicates
+ * a failure of the command 'cmd' with the message given
+ * by gcry_strerror(rc).
+ */
+#define LOG_GCRY(cmd, rc) do { fprintf(stderr, "`%s' failed at %s:%d with error: %s\n", cmd, __FILE__, __LINE__, gcry_strerror(rc)); } while(0)
+
+/**
+ * Original termos settings from our terminal
+ */
+static struct termios tc_orig;
 
 //Convention in this file: a function return 1 if successful, 0 otherwise
 //Topics:
@@ -91,15 +111,61 @@ out:
   return ret;
 }
 
+static const char *
+ask_pass ()
+{
+  static char buf[512];         /* Secure this using gcrypt secure mem? */
+  struct termios tc;
+  const char *pass;
+
+  if (0 != (unsigned char) buf[0])
+    return buf;
+  printf ("Enter passphrase for 2 factor auth:");
+  fflush (stdout);
+  tc = tc_orig;
+  (void) memcpy (&tc, &tc_orig, sizeof (tc));
+  tc.c_lflag &= ~(ECHO);
+  (void) tcsetattr (STDIN_FILENO, TCSANOW, &tc);
+  pass = fgets(buf, sizeof(buf), stdin);
+  (void) tcsetattr (STDIN_FILENO, TCSANOW, &tc_orig);
+  return pass;
+}
+
+static void
+xor_mix (unsigned char *challenge, unsigned char *key, size_t len)
+{
+  unsigned int cnt;
+  const char *pass;
+  gcry_error_t gerr;
+
+  for (cnt=0; cnt<len; cnt++)
+    challenge[cnt] ^= key[cnt];
+}
+
 //Do a HMAC challenge-response on slot 2 for a HASH_LENGTH-byte challenge, and give a HASH_LENGTH-byte response
 int challenge_response(YK_KEY *yk, unsigned char *challenge, unsigned char *response)
 {
   unsigned char internal_response[64];
   unsigned int response_len = 0;
+  unsigned char xored_challenge[HASH_LENGTH];
+  gcry_error_t gerr;
+  const char *pass;
 
+  pass = ask_pass ();
+  if (0 != (gerr = gcry_kdf_derive (pass, strlen(pass),
+                                    GCRY_KDF_PBKDF2,
+                                    GCRY_MD_SHA1,
+                                    "salt0x88", 4, /* salt & salt length */
+                                    4, /* iterations */
+                                    HASH_LENGTH, xored_challenge)))
+  {
+    LOG_GCRY ("gcry_kdf_derive", gerr);
+    return 0;
+  }
   memset(response, 0, HASH_LENGTH);
+  xor_mix (xored_challenge, challenge, HASH_LENGTH);
 
-  if (!yk_write_to_key(yk, SLOT_CHAL_HMAC2, challenge, HASH_LENGTH)) return 0;
+  if (!yk_write_to_key(yk, SLOT_CHAL_HMAC2, xored_challenge, HASH_LENGTH)) return 0;
 
   if (!yk_read_response_from_key(yk, YK_SLOT, YK_FLAG_MAYBLOCK, &internal_response, 64, HASH_LENGTH, &response_len))
     return 0;
@@ -376,7 +442,7 @@ int get_random_challenge(unsigned char* challenge) {
   int ret = 0;
   FILE *random;
   
-  random = fopen("/dev/random","r");
+  random = fopen("/dev/urandom","r");
   
   if (fread(challenge, 1, HASH_LENGTH, random) == HASH_LENGTH) {
     ret = 1;
@@ -390,19 +456,33 @@ int get_random_challenge(unsigned char* challenge) {
 int main(int argc, char **argv) {
   int luks_opened = 0;
   int write_new_challenge = 0;
-  
   unsigned char challenge[HASH_LENGTH];
   unsigned char response[HASH_LENGTH];
   unsigned char new_challenge[HASH_LENGTH];
   unsigned char new_response[HASH_LENGTH];
-  
+
+  if (!isatty(STDIN_FILENO))
+  {
+    fprintf (stderr, "cannot find an associated pty\n");
+    return 1;
+  }
+  if (0 != tcgetattr (STDIN_FILENO, &tc_orig))
+  {
+    fprintf(stderr,"Cannot access terminal settings; are you running from a terminal?\n");
+    return 1;
+  }
   if (argc != 3) {
     fprintf(stderr,"Usage: %s [device] [name]\n",argv[0]);
     return 1;
   }
-  
+  if (!gcry_check_version (GCRYPT_VERSION))
+  {
+    fprintf(stderr, "libgcrypt version mismatch\n");
+    return 1;
+  }
   if (!is_luks(argv[1])) {
-    fprintf(stderr,"Error: unable to open LUKS device (not root/invalid file?)\n");
+    fprintf(stderr,"Error: unable to open LUKS device %s (not root/invalid file?)\n",
+            argv[1]);
     return 1;
   }
   
@@ -413,15 +493,15 @@ int main(int argc, char **argv) {
   
   fprintf(stderr, "Reading challenge...");
   if (!get_challenge(argv[1],challenge)) {
-    fprintf(stderr,"Error: unable to read challenge, using /dev/random!\n");
+    fprintf(stderr,"Error: unable to read challenge, using /dev/urandom!\n");
     if (!get_random_challenge(challenge)) {
-      fprintf(stderr,"Error: unable to use /dev/random!\n");
+      fprintf(stderr,"Error: unable to use /dev/urandom!\n");
       return 1;
     }
   }
   fprintf(stderr, "done!\n");
   
-  fprintf(stderr, "Challenging the Yubikey...");
+  fprintf(stderr, "Challenging the Yubikey...\n");
   if (yk_query(challenge, response, new_challenge, new_response)) {
     //Ok we are successful, so we need to write new challenge
     write_new_challenge = 1;
